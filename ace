@@ -1,0 +1,618 @@
+#!/bin/perl
+#===============================================================================
+#
+#         FILE: ace
+#
+#        USAGE: ace <options>
+#      OPTIONS: --copy_to | --copy_from | --exec | --list | --destination |
+#               --username | --password | --identity <file> | --config <file> |
+#               --group
+#       AUTHOR: Dayton Jones (dj), dayton@gecko.org
+#      VERSION: 3.0
+#  DESCRIPTION: ace allows a user to run commands or copy some files/directories
+#               to/from multiple hosts by issuing a single command on the
+#               admin host.
+#===============================================================================
+
+use Cwd 'abs_path';
+use File::Basename;
+use File::Path qw(make_path);
+use Getopt::Long;
+use Net::SCP::Expect;
+use Net::SSH::Perl;
+use Term::ANSIColor;
+use Term::ReadKey;
+use Net::Ping;
+
+  #########################################
+  #        Configuration Section          #
+  #########################################
+$PROGNAME=basename($0);
+($MYPATH)=abs_path($0) =~ m/(.*)\/$PROGNAME/i;
+$run_user=(getpwuid($<))[0];
+$CONFIG_FILE = "$MYPATH/$PROGNAME.conf";
+$cline=join " ", $0, @ARGV;
+$version="3.0";
+$SIG {"TERM"} = \&term_exit;
+$SIG {"HUP"} = \&term_exit;
+$SIG {"INT"} = \&int_exit;
+
+  #########################################
+  #            Sub-Routines               #
+  #########################################
+
+sub load_config {
+    local $group = "";
+# Check to see if configuration file exists.
+      if (-e "$CONFIG_FILE") {
+          open (CONFIG_FILE, "<$CONFIG_FILE");
+          @Raw_Config = <CONFIG_FILE>;
+          close (CONFIG_FILE);
+      } else {
+          print colored ['red'],"Unable to access configuration file.\nPlease make sure \"$CONFIG_FILE\" exists.\n\n";
+          exit;
+      }
+
+      # Process raw data array removing comments and creating the conf array
+      while ($raw_item = shift (@Raw_Config)) {
+          if (!($raw_item =~ /^#/ )) {
+              @raw_array = split(/#/, $raw_item);
+              chomp $raw_array[0];
+              push (@conf_array, $raw_array[0]);
+          }
+      }
+      # Process conf array creating groups and placing members into those groups
+      @Conf_Groups = "";
+      $group = "";
+      while ($conf_item = shift (@conf_array)) {
+          ($host, $hostgroups) = split(/:/, $conf_item);
+          (@Host_Group_Array) = split(/,/, $hostgroups);
+          foreach $group (@Host_Group_Array) {
+              if (!(grep /$group/, @Conf_Groups)) {
+                  push (@Conf_Groups, $group);
+              }
+              push (@{$group}, $host);
+          }
+      }
+    # Create execution array based on command line options
+
+      # differentiate between "logical and"='.' and "logical or"=('+' or ',') relation of
+      # group memberships.
+      # We use different delimiters for that adhering to established Boole Logic operators.
+      # The meaning of the legacy delimiter ',' is retained as "logical or" -- menze@vitesse.com
+    if ( grep /\+/, $GROUP) {
+        @EXECUTION_GROUPS = split(/\+/, $GROUP);
+        $op_mode = "and";
+    } else {
+        @EXECUTION_GROUPS = split(/\,/, $GROUP);
+        $op_mode = "or";
+    }
+
+    if (($#EXECUTION_GROUPS >= "0") && (!(@HOSTS))) {
+        $group = "";
+        if ( $op_mode eq "or") {
+            foreach $group (@EXECUTION_GROUPS) {
+                foreach $member (@{$group}) {
+                    # Check for unique before push
+                    if (!(grep /$member/, @EXECUTION_HOSTS)) {
+                        push (@EXECUTION_HOSTS, $member);
+                    }
+                }
+            }
+        } else {
+            $group = $EXECUTION_GROUPS[0];
+            foreach $member (@{$group}) {
+                $not_found = 0;
+                foreach $tstgr (@EXECUTION_GROUPS) {
+                    if (!(grep /$member/, @{$tstgr})) {
+                        $not_found = 1;
+                    }
+                }
+                if ( $not_found == 0) {
+                    # Check for unique before push
+                    if (!(grep /$member/, @EXECUTION_HOSTS)) {
+                        push (@EXECUTION_HOSTS, $member);
+                    }
+                }
+            }
+        }
+    } else {
+        if (!(@HOSTS)) {
+            foreach $group (@Conf_Groups) {
+                foreach $member (@{$group}) {
+                    if (!(grep /$member/, @EXECUTION_HOSTS)) {
+                        push (@EXECUTION_HOSTS, $member);
+                    }
+                }
+            }
+        } else {
+            @EXECUTION_HOSTS = @HOSTS;
+        }
+    }
+    return;
+}
+
+sub show_groups {
+          print "\n Valid Host Groups:\n\n";
+          local $alt = 0;
+          local $spacer = 0;
+          foreach $member (@Conf_Groups) {
+                  if ($alt eq 0) {
+                          print "     ".$member;
+                          $alt = 1;
+                          $spacer = (30 - length($member));
+                  } else {
+                          if ($alt eq 1) {
+                                  for ($spacer; $spacer > 0; $spacer--) {
+                                          print " ";
+                                }
+                                  print $member."\n";
+                                  $alt = 0;
+                      }
+          }
+                  if ($member eq $Conf_Groups[$#Conf_Groups]) {
+                          print "\n";
+                  }
+          }
+      exit;
+
+}
+sub syntax{
+    if (@_) {
+        print "You entered an invalid option \"@_\".\n";
+    }
+    print colored ['yellow'],"
+
+    --------------------------------------------------------------
+
+        Options -
+          --config <file>       : Alternate configuration file (default: $CONFIG_FILE)
+          --copy_from <file>    : Retrieves file from all hosts in group
+          --copy_to <file>      : Copy operation (Multiple)
+          --destination <dir>   : Set destination for copied files
+          --exec \"cmd\"          : Execute cmd (Multiple)
+          --group group{,x,y}   : Specify groups for operation, on all specified groups
+          --group group{+x+y}   : Specify groups for operation, only on hosts in ALL specified groups
+          --help                : Display the program help
+          --identity <file>     : Use specified identity file to connect
+          --list                : Show list of groups in the configuration file
+          --log                 : Write the output of all commands to /tmp/$PROGNAME-(time)_(date).log
+          --password            : Specify to use a password (will be prompted for it)
+          --username <user>     : Connect as user
+          --version             : Display verion of $PROGNAME
+
+        Configuration file Syntax
+          Notes:
+            1. All lines beginning with \"#\" are ignored.
+            2. Any text after a \"#\" on a single line are ignored.
+
+        Each line within the configuration file is for a single
+        host, and formatted as follows.
+
+      [HOSTNAME]:[GROUP]{,GROUP,GROUP,...}
+
+      --------------------------------------------------------------
+\n"
+}
+
+sub PING_TEST{
+    $myhost=shift;
+    $p = Net::Ping->new();
+#    print colored ['green'],"$myhost is alive\n" if $p->ping($myhost,2);
+#    if ($OUTPUT){
+#        print OUT "$myhost is alive\n" if $p->ping($myhost,2);
+#    }
+#    print colored ['yellow'],"$myhost is unreachable\n" if not $p->ping($myhost,2);
+#    if ($OUTPUT){
+#        print OUT "$myhost is unreachable\n" if not $p->ping($myhost,2);
+#    }
+#    next if not $p->ping($myhost);
+
+    if ($p->ping($myhost,2)){
+        print colored ['green'],"$myhost is alive\n";
+        if ($OUTPUT){
+          print OUT "$myhost is alive\n";
+        }
+    }else{
+        print colored ['yellow'],"$myhost is unreachable, skipping\n";
+        if ($OUTPUT){
+          print OUT "$myhost is unreachable, skipping\n";
+        }
+        next;
+    }
+}
+
+sub GET_FILE{
+    foreach $copy_file (@GET) {
+        $ssh_conf="$ENV{'HOME'}/.ssh/config";
+        $cfg = Net::SSH::Perl::Config->new($host);
+        $cfg->read_config($ssh_conf);
+        if (! $USERNAME){
+            $USER=$cfg->get('user');
+        }
+        if (! $IDENTITY){
+            if (! $cfg->get('identity_files')){
+                $myid="";
+                $useid="false";
+            } else {
+                $my_id=$cfg->get('identity_files');
+                if (! $myid) {
+                    $myid=@$my_id[0];
+                    $useid="true";
+                }
+            }
+        }
+        if (! $DEST) {
+            $DEST=".";
+        }
+        $local_dst="$DEST/$host" . "$copy_file";
+        print colored ['green'],"user \"$USER\" copying \"$host:$copy_file\" to \"$local_dst\" \n";
+        if ($OUTPUT){
+            print OUT "user \"$USER\" copying \"$host:$copy_file\" to \"$local_dst\" \n";
+        }
+        $r_path=dirname($copy_file);
+        if ($DEST ne ""){
+            unless (-d "$DEST/$host/$r_path"){
+                make_path("$DEST/$host/$r_path");
+            }
+        } else {
+            unless (-d "$host") {
+                make_path("$host/$r_path");
+            }
+        }
+        if ($mypass) {
+            chomp($mypass,$USER,$host);
+            $scpe = Net::SCP::Expect->new(timeout=>'15', auto_quote=>'0', preserve=>'1', auto_yes=>'1', recursive=>'1', user=>$USER, password=>$mypass);
+        }else{
+            if ($useid eq "true"){
+                print "using ID: $myid\n";
+                $scpe = Net::SCP::Expect->new(timeout=>'15', auto_quote=>'0', preserve=>'1', auto_yes=>'1', recursive=>'1', user=>$USER, identity_file=>$myid);
+                if ($OUTPUT){
+                    print OUT "using ID: $myid\n";
+                }
+            }else{
+                print colored ['red'], "No password or identity_file specified\n";
+                if ($OUTPUT){
+                    print OUT "No password or identity_file specified\n";
+                }
+            }
+        }
+#        eval {$scpe->scp($host.":".$copy_file,$local_dst);}; warn colored ['red'], $@ if $@;
+        #eval {$scpe->scp($host.":".$copy_file,$local_dst);}; print colored ['red'], "Unable to connect to $host\n" if $@;
+        eval {$scpe->scp($host.":".$copy_file,$local_dst);};
+        if ($@){
+            print colored ['red'], "Unable to connect to $host\n" if $@;
+            if ($OUTPUT){
+                print OUT "Unable to connect to $host\n";
+            }
+        }
+    }
+}
+
+sub COPY_FILE{
+    if (! $DEST){
+        print colored ['red'],"No destination set, please use --destination to specify remote directory...\n";
+        if ($OUTPUT){
+            print OUT "No destination set, please use --destination to specify remote directory...\n";
+            close(OUT);
+        }
+        exit 1;
+    }
+    foreach $copy_file (@COPY) {
+        $ssh_conf="$ENV{'HOME'}/.ssh/config";
+        $cfg = Net::SSH::Perl::Config->new($host);
+        $cfg->read_config($ssh_conf);
+        if (! $USERNAME){
+            $USER=$cfg->get('user');
+        }
+        if (! $IDENTITY){
+            if (! $cfg->get('identity_files')){
+                $myid="";
+                $useid="false";
+            } else {
+                $my_id=$cfg->get('identity_files');
+                if (! $myid) {
+                    $myid=@$my_id[0];
+                    $useid="true";
+                }
+            }
+        }
+        $file=basename($copy_file);
+#        print colored ['green'],"user \"$USER\" copying \"$copy_file\" to \"${host}:${DEST}${file}\" \n";
+        if ($mypass) {
+            chomp($mypass,$USER,$host);
+            $scpe = Net::SCP::Expect->new(timeout=>'15', auto_quote=>'0', preserve=>'1', auto_yes=>'1', recursive=>'1', user=>$USER, password=>$mypass);
+        }else{
+            if ($useid eq "true"){
+                print "using ID: $myid\n";
+                if ($OUTPUT){
+                    print OUT "using ID: $myid\n";
+                }
+                $scpe = Net::SCP::Expect->new(timeout=>'15', auto_quote=>'0', preserve=>'1', auto_yes=>'1', recursive=>'1', user=>$USER, identity_file=>$myid);
+            }else{
+                print colored ['red'], "No password or identity_file specified\n";
+                if ($OUTPUT){
+                    print OUT "No password or identity_file specified\n";
+                }
+            }
+        }
+#        eval {$scpe->scp($copy_file,"$host:$DEST/$file");}; warn colored ['red'], $@ if $@;
+        if ( -d $copy_file ){
+            print colored ['green'],"user \"$USER\" recursively copying \"$copy_file\" to \"${host}:${DEST}${file}\" \n";
+            if ($OUTPUT){
+                print OUT "user \"$USER\" recursively copying \"$copy_file\" to \"${host}:${DEST}${file}\" \n";
+            }
+            eval {$scpe->scp("$copy_file","${host}:${DEST}/${file}");};
+            if ($@) {
+                print colored ['red'], "Unable to connect to $host\n";
+                if ($OUTPUT) {
+                    print OUT "Unable to connect to $host\n";
+                }
+            }
+        }elsif ( -f $copy_file ){
+            print colored ['green'],"user \"$USER\" copying \"$copy_file\" to \"${host}:${DEST}/${file}\" \n";
+            if ($OUTPUT){
+                print OUT "user \"$USER\" copying \"$copy_file\" to \"${host}:${DEST}/${file}\" \n";
+            }
+            eval {$scpe->scp("$copy_file","${host}:${DEST}/${file}");};
+            if ($@){
+                print colored ['red'], "Unable to connect to $host\n";
+                if ($OUTPUT){
+                    print OUT "Unable to connect to $host\n";
+                }
+            }
+        }
+    }
+}
+
+sub EXEC_COMMAND{
+###
+        PING_TEST($host);
+###
+    foreach $exec_cmd (@EXEC) {
+        $ssh = Net::SSH::Perl->new("$host",options => ["ConnectTimeout=5","StrictHostKeyChecking=no"]);
+        $ssh_conf="$ENV{'HOME'}/.ssh/config";
+        $cfg = Net::SSH::Perl::Config->new($host);
+        $cfg->read_config($ssh_conf);
+        if (! $USERNAME){
+            $USER=$cfg->get('user');
+        }
+        print colored ['green'],"user \"$USER\" executing: \"$exec_cmd\"\n";
+        if ($OUTPUT){
+            print OUT "user \"$USER\" executing: \"$exec_cmd\"\n";
+        }
+        if ($use_pass == "true"){
+            eval{$ssh->login($USER,$mypass);}; return if not $@;
+            if ($@){
+                print colored ['red'], "Unable to connect to $host\n";
+                if ($OUTPUT){
+                    print OUT "Unable to connect to $host\n";
+                }
+            }
+        }else{
+            #eval{$ssh->login($USER);}; print colored ['red'], "Unable to connect to $host\n" if $@;
+            eval{$ssh->login($USER);}; return if not $@;
+            if ($@){
+                print colored ['red'], "Unable to connect to $host\n";
+                if ($OUTPUT){
+                    print OUT "Unable to connect to $host\n";
+                }
+            }
+        }
+        eval{($out, $err, $exit)=$ssh->cmd($exec_cmd);};print colored ['red'], "Unable to execute: $exec_cmd\n" if $@;
+        if ($out){
+            print $out;
+            if ($OUTPUT){
+                print OUT $out;
+            }
+        } else {
+            print "$err\n$exit";
+            if ($OUTPUT){
+                print OUT "$err\n$exit";
+            }
+        }
+    }
+}
+
+sub VERBOSE_OUT {
+    $verbose_header = shift(@_);
+    @verbose_text = @_;
+
+    if ($verbose_header eq "2") {
+        print "-=[ ".$verbose_text[0]." ]=-\n";
+        if ($OUTPUT){
+            print OUT "-=[ ".$verbose_text[0]." ]=-\n";
+        }
+    }
+    return;
+}
+
+sub help {
+    system("clear");
+    print colored ['magenta'] , "$PROGNAME v$version\n\n";
+    print colored ['red'],"To copy a file to multiple machines:
+        " . colored ['yellow'],"$PROGNAME --group linux --copy_to <file> -d <remote directory>\n\n";
+    print colored ['cyan'],"        $PROGNAME will create the specified remote directory on each host, if missing.
+        If no destination is specified, the current working directory will be used.\n\n";
+    print colored ['red'],"To copy a file from multiple machines:
+        " . colored ['yellow'],"$PROGNAME -g webservers --copy_from <remote/path/file> -d <directory>\n\n";
+    print colored ['cyan'],"        $PROGNAME will create a new directory for each host in the destination directory.
+        If no destination is specified, the current working directory will be used.\n\n";
+    print colored ['red'],"To remotely run <command> on multiple machines:
+        " . colored ['yellow'],"$PROGNAME --group redhat -e <command>\n\n";
+    print colored ['cyan'],"        $PROGNAME will read the default config file (or your specified one) to get the
+        groups/hosts to utilize.\n\n";
+    print colored ['red'],"To view the lists of configured hosts:
+        " . colored ['yellow'],"$PROGNAME -l\n\n";
+    print colored ['red'],"Examples:\n";
+    print colored ['green'],"     $PROGNAME -g database --copy_to buh.dat -d /opt/gecko/\n";
+    print colored ['green'],"     $PROGNAME --group fe_web --copy_from /opt/gecko/buh.dat --destination /reports/\n";
+    print colored ['green'],"     $PROGNAME --group all -e uptime\n";
+    print colored ['cyan'],"Commands can be stacked, \"copy_to\" runs first, \"exec\" runs second, \"copy_from\" runs last\n";
+    print colored ['green'],"     $PROGNAME -g linux+ssh --exec \"/tmp/test.sh;uptime\" --copy_to test.sh -d /tmp\n";
+    print colored ['magenta'],"This will copy \"test.sh\" to \"/tmp\", run the copied file and then execute \"uptime\"\n";
+}
+
+sub term_exit {
+    print colored ['red'],"$PROGNAME: Terminated\n";
+    if ($OUTPUT){
+        print OUT "\n$PROGNAME: Terminated\n";
+        close(OUT);
+        print "\nSession logged to $mylog\n";
+    }
+    exit;
+}
+
+sub int_exit {
+    print colored ['yellow'],"$PROGNAME:" . colored ['red'], "Aborted by user\n";
+    if ($OUTPUT){
+        print OUT "\n$PROGNAME: Aborted by user\n";
+        close(OUT);
+        print "\nSession logged to $mylog\n";
+    }
+    exit;
+}
+sub get_opts {
+    GetOptions('copy_to=s'      =>\@COPY,
+           'copy_from=s'    =>\@GET,
+           'destination=s'  =>\$DEST,
+           'exec=s'         =>\@EXEC,
+           'config=s'       =>\$CONFIG_FILE,
+           'version'        =>\$VERSION,
+           'list'           =>\$LIST,
+           'log'            =>\$OUTPUT,
+           'username=s'     =>\$USERNAME,
+           'password'       =>\$PASSWORD,
+           'identity=s'     =>\$IDENTITY,
+           'group=s'        =>\$GROUP,
+           'help|?'         =>\$HELP);
+
+    if ($HELP) {
+        &help;
+        &syntax();
+        exit;
+    }
+
+    if ($OUTPUT) {
+        chomp($DATE=`date +%H%M_%d%m%Y`);
+        $mylog="/tmp/ace-${DATE}.log";
+    }
+
+    if ($IDENTITY) {
+        $myid=$IDENTITY;
+        $useid="true";
+    }
+    if ($USERNAME) {
+#        $run_user=$USERNAME;
+        $USER=$USERNAME;
+    }else{
+        $USER=$run_user;
+    }
+
+    if ($PASSWORD) {
+        $use_pass="true";
+        print "\nEnter Password (will be hidden): \n";
+        ReadMode 4;
+        while(ord($key = ReadKey(0)) != 10) {
+            exit 0 if $key eq 'q';
+            if(ord($key) == 127 or ord($key) == 8) {
+                chop($mypass);
+                print "\b \b";
+            }
+            elsif(ord($key) < 32) {
+                ();
+            }
+            else {
+                $mypass = $mypass . $key;
+                print "*";
+            }
+        }
+        ReadMode(0);
+    }
+
+    if ($VERSION) {
+        print colored ['green'],"$PROGNAME v$version\n";
+        exit;
+    }
+
+    if ($LIST) {
+        &load_config;
+        &show_groups;
+        exit;
+    }
+}
+
+  #================================
+  # Main Program
+  #================================
+system("clear");
+#if (@ARGV < 0){
+if (@ARGV == 0){
+    &help;
+    &syntax;
+    exit 1;
+}
+system("clear");
+&get_opts;
+
+open (OUT,">>$mylog");
+
+print "\n==============================================================\n";
+print " Host Maintenance Utility - $PROGNAME";
+$spacer = (60-(34+length($version)));
+for ($spacer; $spacer > 0; $spacer--) {
+    print " ";
+}
+print $version," \n";
+print "==============================================================\n\n";
+
+if ($OUTPUT){
+    print OUT "\n==============================================================\n";
+    print OUT " Host Maintenance Utility - $PROGNAME";
+    $spacer = (60-(34+length($version)));
+    for ($spacer; $spacer > 0; $spacer--) {
+        print OUT" ";
+    }
+    print OUT $version," \n";
+    chomp($date=`date`);
+    print OUT "  Executed by: $ENV{'USER'} at $date\n";
+    print OUT "  Command: $cline\n";
+    print OUT "==============================================================\n\n";
+}
+
+&load_config;
+  #----------------------------------
+  # Begin Main loop
+  #----------------------------------
+if (@EXECUTION_HOSTS) {
+    foreach $host (@EXECUTION_HOSTS) {
+        $sw=`tput cols`;
+        &VERBOSE_OUT("2","$host");
+    # Check to see if we need to copy files to remote machines (Always complete copy before execution)
+        if (@COPY) {
+            COPY_FILE();
+        }
+    # Check to see if we need to execute anything after copying file (if necessary)
+        if (@EXEC) {
+            EXEC_COMMAND();
+        }
+    # Retrieve any files is requested after all other operations
+        if (@GET) {
+            GET_FILE();
+        }
+        print ( "_" x $sw);
+        print "\n";
+        if ($OUTPUT){
+            print OUT "==============================================================\n==============================================================\n\n";
+        }
+      }
+} else {
+    &show_groups;
+    exit 1;
+}
+print "\n\n";
+if ($OUTPUT){
+    close(OUT);
+    print "\nSession logged to $mylog\n";
+}
+exit 0;

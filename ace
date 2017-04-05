@@ -1,4 +1,4 @@
-#!/bin/perl
+#!/usr/bin/env perl
 #===============================================================================
 #
 #         FILE: ace
@@ -28,6 +28,7 @@ use Net::Ping;
   #        Configuration Section          #
   #########################################
 $PROGNAME=basename($0);
+$LONGNAME="Admin Control Execution";
 ($MYPATH)=abs_path($0) =~ m/(.*)\/$PROGNAME/i;
 $run_user=(getpwuid($<))[0];
 $CONFIG_FILE = "$MYPATH/$PROGNAME.conf";
@@ -429,7 +430,7 @@ sub VERBOSE_OUT {
 
 sub help {
     system("clear");
-    print colored ['magenta'] , "$PROGNAME v$version\n\n";
+    print colored ['magenta'] , "$LONGNAME ($PROGNAME) v$version\n\n";
     print colored ['red'],"To copy a file to multiple machines:
         " . colored ['yellow'],"$PROGNAME --group linux --copy_to <file> -d <remote directory>\n\n";
     print colored ['cyan'],"        $PROGNAME will create the specified remote directory on each host, if missing.
@@ -558,7 +559,7 @@ system("clear");
 open (OUT,">>$mylog");
 
 print "\n==============================================================\n";
-print " Host Maintenance Utility - $PROGNAME";
+print " Admin Control Execution - $PROGNAME";
 $spacer = (60-(34+length($version)));
 for ($spacer; $spacer > 0; $spacer--) {
     print " ";
@@ -568,7 +569,7 @@ print "==============================================================\n\n";
 
 if ($OUTPUT){
     print OUT "\n==============================================================\n";
-    print OUT " Host Maintenance Utility - $PROGNAME";
+    print OUT " Admin Control Execution - $PROGNAME";
     $spacer = (60-(34+length($version)));
     for ($spacer; $spacer > 0; $spacer--) {
         print OUT" ";

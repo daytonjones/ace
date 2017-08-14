@@ -134,29 +134,24 @@ sub load_config {
 }
 
 sub show_groups {
-          print "\n Valid Host Groups:\n\n";
-          local $alt = 0;
-          local $spacer = 0;
-          foreach $member (@Conf_Groups) {
-                  if ($alt eq 0) {
-                          print "     ".$member;
-                          $alt = 1;
-                          $spacer = (30 - length($member));
-                  } else {
-                          if ($alt eq 1) {
-                                  for ($spacer; $spacer > 0; $spacer--) {
-                                          print " ";
-                                }
-                                  print $member."\n";
-                                  $alt = 0;
-                      }
-          }
-                  if ($member eq $Conf_Groups[$#Conf_Groups]) {
-                          print "\n";
-                  }
-          }
-      exit;
-
+    print "\n Valid Host Groups:\n\n";
+    local $alt = 0;
+    local $spacer = 0;
+    foreach $member (sort @Conf_Groups) {
+        if ($alt eq 0) {
+            print "     ".$member;
+            $alt = 1;
+            $spacer = (30 - length($member));
+        } elsif ($alt eq 1) {
+            for ($spacer; $spacer > 0; $spacer--) {print " ";}
+            print $member."\n";
+            $alt = 0;
+        }
+    }
+    if ($member eq $Conf_Groups[$#Conf_Groups]) {
+        print "\n";
+    }
+    exit;
 }
 sub syntax{
     if (@_) {
@@ -198,7 +193,7 @@ sub syntax{
 
 sub PING_TEST{
     $myhost=shift;
-    $p = Net::Ping->new();
+    $p = Net::Ping->new("external");
 #    print colored ['green'],"$myhost is alive\n" if $p->ping($myhost,2);
 #    if ($OUTPUT){
 #        print OUT "$myhost is alive\n" if $p->ping($myhost,2);
@@ -209,7 +204,7 @@ sub PING_TEST{
 #    }
 #    next if not $p->ping($myhost);
 
-    if ($p->ping($myhost,2)){
+    if ($p->ping($myhost,5)){
         print colored ['green'],"$myhost is alive\n";
         if ($OUTPUT){
           print OUT "$myhost is alive\n";
@@ -221,6 +216,7 @@ sub PING_TEST{
         }
         next;
     }
+    $p->close;
 }
 
 sub GET_FILE{
@@ -278,11 +274,9 @@ sub GET_FILE{
                 }
             }
         }
-#        eval {$scpe->scp($host.":".$copy_file,$local_dst);}; warn colored ['red'], $@ if $@;
-        #eval {$scpe->scp($host.":".$copy_file,$local_dst);}; print colored ['red'], "Unable to connect to $host\n" if $@;
         eval {$scpe->scp($host.":".$copy_file,$local_dst);};
         if ($@){
-            print colored ['red'], "Unable to connect to $host\n" if $@;
+            print colored ['red'], "Unable to connect to $host\n$@\n" if $@;
             if ($OUTPUT){
                 print OUT "Unable to connect to $host\n";
             }
@@ -319,17 +313,18 @@ sub COPY_FILE{
             }
         }
         $file=basename($copy_file);
-#        print colored ['green'],"user \"$USER\" copying \"$copy_file\" to \"${host}:${DEST}${file}\" \n";
         if ($mypass) {
             chomp($mypass,$USER,$host);
-            $scpe = Net::SCP::Expect->new(timeout=>'15', auto_quote=>'0', preserve=>'1', auto_yes=>'1', recursive=>'1', user=>$USER, password=>$mypass);
+#            $scpe = Net::SCP::Expect->new(timeout=>'15', auto_quote=>'0', preserve=>'1', auto_yes=>'1', recursive=>'1', user=>$USER, password=>$mypass);
+            $scpe = Net::SCP::Expect->new(verbose=>'true', timeout=>'15', auto_quote=>'0', preserve=>'1', auto_yes=>'1', recursive=>'1', user=>$USER, password=>$mypass);
         }else{
             if ($useid eq "true"){
-                print "using ID: $myid\n";
+#                print "using ID: $myid\n";
                 if ($OUTPUT){
                     print OUT "using ID: $myid\n";
                 }
-                $scpe = Net::SCP::Expect->new(timeout=>'15', auto_quote=>'0', preserve=>'1', auto_yes=>'1', recursive=>'1', user=>$USER, identity_file=>$myid);
+#                $scpe = Net::SCP::Expect->new(timeout=>'15', auto_quote=>'0', preserve=>'1', auto_yes=>'1', recursive=>'1', user=>$USER, identity_file=>$myid);
+                $scpe = Net::SCP::Expect->new(verbose=>'1', timeout=>'15', auto_quote=>'0', preserve=>'1', auto_yes=>'1', recursive=>'1', user=>$USER, identity_file=>$myid);
             }else{
                 print colored ['red'], "No password or identity_file specified\n";
                 if ($OUTPUT){
@@ -337,7 +332,6 @@ sub COPY_FILE{
                 }
             }
         }
-#        eval {$scpe->scp($copy_file,"$host:$DEST/$file");}; warn colored ['red'], $@ if $@;
         if ( -d $copy_file ){
             print colored ['green'],"user \"$USER\" recursively copying \"$copy_file\" to \"${host}:${DEST}${file}\" \n";
             if ($OUTPUT){
@@ -368,33 +362,35 @@ sub COPY_FILE{
 
 sub EXEC_COMMAND{
 ###
-        PING_TEST($host);
+        &PING_TEST($host);
 ###
     foreach $exec_cmd (@EXEC) {
-        $ssh = Net::SSH::Perl->new("$host",options => ["ConnectTimeout=5","StrictHostKeyChecking=no"]);
+        $ssh = Net::SSH::Perl->new($host,options => ["ConnectTimeout=5","StrictHostKeyChecking=no"]);
+#        $ssh = Net::SSH::Perl->new($host,debug=>"true",options => ["ConnectTimeout=5","StrictHostKeyChecking=no"]);
         $ssh_conf="$ENV{'HOME'}/.ssh/config";
         $cfg = Net::SSH::Perl::Config->new($host);
         $cfg->read_config($ssh_conf);
         if (! $USERNAME){
             $USER=$cfg->get('user');
+        }else{
+            $USER=$USERNAME;
         }
         print colored ['green'],"user \"$USER\" executing: \"$exec_cmd\"\n";
         if ($OUTPUT){
             print OUT "user \"$USER\" executing: \"$exec_cmd\"\n";
         }
         if ($use_pass == "true"){
-            eval{$ssh->login($USER,$mypass);}; return if not $@;
+            eval{$ssh->login($USER,$mypass);}; #return if not $@;
             if ($@){
-                print colored ['red'], "Unable to connect to $host\n";
+                print colored ['red'], "Unable to connect to $host\n$@\n";
                 if ($OUTPUT){
                     print OUT "Unable to connect to $host\n";
                 }
             }
         }else{
-            #eval{$ssh->login($USER);}; print colored ['red'], "Unable to connect to $host\n" if $@;
-            eval{$ssh->login($USER);}; return if not $@;
+            eval{$ssh->login($USER);}; #return if not $@;
             if ($@){
-                print colored ['red'], "Unable to connect to $host\n";
+                print colored ['red'], "Unable to connect to $host\n$@\n";
                 if ($OUTPUT){
                     print OUT "Unable to connect to $host\n";
                 }
@@ -504,7 +500,6 @@ sub get_opts {
         $useid="true";
     }
     if ($USERNAME) {
-#        $run_user=$USERNAME;
         $USER=$USERNAME;
     }else{
         $USER=$run_user;
@@ -561,9 +556,7 @@ open (OUT,">>$mylog");
 print "\n==============================================================\n";
 print " Admin Control Execution - $PROGNAME";
 $spacer = (60-(34+length($version)));
-for ($spacer; $spacer > 0; $spacer--) {
-    print " ";
-}
+for ($spacer; $spacer > 0; $spacer--) {print " ";}
 print $version," \n";
 print "==============================================================\n\n";
 
@@ -571,9 +564,7 @@ if ($OUTPUT){
     print OUT "\n==============================================================\n";
     print OUT " Admin Control Execution - $PROGNAME";
     $spacer = (60-(34+length($version)));
-    for ($spacer; $spacer > 0; $spacer--) {
-        print OUT" ";
-    }
+    for ($spacer; $spacer > 0; $spacer--) {print OUT" ";}
     print OUT $version," \n";
     chomp($date=`date`);
     print OUT "  Executed by: $ENV{'USER'} at $date\n";
